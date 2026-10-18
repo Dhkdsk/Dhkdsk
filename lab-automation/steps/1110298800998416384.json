@@ -1,0 +1,28 @@
+{
+  "testId": "1110298800998416384",
+  "name": "B003 openGauss数据库对象创建",
+  "setup": [
+    "DROP DATABASE IF EXISTS db1; DROP DATABASE IF EXISTS db2; DROP DATABASE IF EXISTS dbtrade;"
+  ],
+  "steps": [
+    {"caption": "创建数据库 db1", "commands": ["CREATE DATABASE db1;"], "wait": 2.0},
+    {"caption": "使用 \\l 查看数据库列表，可见 db1", "commands": ["\\l"], "wait": 2.0},
+    {"caption": "使用 \\c db1 切换数据库", "commands": ["\\c db1"], "wait": 2.0},
+    {"caption": "使用 \\c postgres 切回默认数据库", "commands": ["\\c postgres"], "wait": 2.0},
+    {"caption": "使用 ALTER DATABASE 将 db1 重命名为 db2", "commands": ["ALTER DATABASE db1 RENAME TO db2;"], "wait": 2.0},
+    {"caption": "查看数据库列表，名称已变为 db2", "commands": ["\\l"], "wait": 2.0},
+    {"caption": "使用 DROP DATABASE 删除 db2", "commands": ["DROP DATABASE db2;"], "wait": 2.0},
+    {"caption": "查看数据库列表，db2 已删除", "commands": ["\\l"], "wait": 2.0},
+    {"caption": "创建数据库 dbtrade 并查看列表", "commands": ["CREATE DATABASE dbtrade;", "\\l"], "wait": 2.2},
+    {"caption": "切换到数据库 dbtrade", "commands": ["\\c dbtrade"], "wait": 2.0},
+    {"caption": "创建产品类别表 Categories", "commands": ["CREATE TABLE Categories\n(\nCategoryID SERIAL PRIMARY KEY,\nCategoryName VARCHAR(15) NOT NULL\n);"], "wait": 2.2},
+    {"caption": "使用 \\dt 查看数据库中的表", "commands": ["\\dt"], "wait": 2.0},
+    {"caption": "使用 \\d+ 查看 Categories 表结构", "commands": ["\\d+ Categories"], "wait": 2.2},
+    {"caption": "删除表 Categories", "commands": ["DROP TABLE IF EXISTS Categories;"], "wait": 2.0},
+    {"caption": "再次查看表，Categories 已删除", "commands": ["\\dt"], "wait": 2.0},
+    {"caption": "创建 Categories 表和 Products 表", "commands": ["CREATE TABLE Categories\n(\nCategoryID SERIAL PRIMARY KEY,\nCategoryName VARCHAR(15) NOT NULL\n);", "CREATE TABLE Products\n(\nProductID SERIAL PRIMARY KEY,\nProductName VARCHAR(40) NOT NULL,\nCategoryID INTEGER,\nSupplierID INTEGER,\nUnitPrice money DEFAULT 0,\nUnitsInStock INTEGER DEFAULT 0,\nReorderLevel INTEGER DEFAULT 0,\nDiscontinued INTEGER NOT NULL\n);"], "wait": 2.8},
+    {"caption": "查看 Products 表结构", "commands": ["\\d+ Products"], "wait": 2.2},
+    {"caption": "为 Products 表添加外键约束 fk_c_id", "commands": ["ALTER TABLE products ADD CONSTRAINT fk_c_id FOREIGN KEY (CategoryID) REFERENCES Categories(CategoryID) ON DELETE CASCADE;"], "wait": 2.2},
+    {"caption": "查看 Products 表结构，外键已添加", "commands": ["\\d+ products"], "wait": 2.2}
+  ]
+}

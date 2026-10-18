@@ -1,0 +1,174 @@
+{
+  "testId": "1110300024384618496",
+  "name": "B006 openGauss安全管理",
+  "capture_stop": false,
+  "setup": [
+    "DROP USER IF EXISTS jim;",
+    "DROP USER IF EXISTS kim;",
+    "DROP USER IF EXISTS tim;",
+    "DROP ROLE IF EXISTS role1;",
+    "DROP ROLE IF EXISTS role10;",
+    "DROP ROLE IF EXISTS role2;",
+    "DROP ROLE IF EXISTS role3;"
+  ],
+  "steps": [
+    {
+      "caption": "创建用户 jim 和 kim",
+      "commands": [
+        "CREATE USER jim PASSWORD 'abcd@123';",
+        "CREATE USER kim IDENTIFIED BY 'abcd@456';"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "查看数据库中的用户",
+      "commands": [
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "为用户 jim 增加创建角色的权限",
+      "commands": [
+        "ALTER USER jim CREATEROLE;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "为用户 jim 增加创建数据库的权限",
+      "commands": [
+        "ALTER USER jim CREATEDB;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "一次性为用户 kim 增加多个权限",
+      "commands": [
+        "ALTER USER kim CREATEDB CREATEROLE;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "权限授予 GRANT",
+      "commands": [
+        "GRANT jim to kim;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "撤销授予的权限 REVOKE",
+      "commands": [
+        "REVOKE jim FROM kim;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "修改用户 jim 的密码",
+      "commands": [
+        "ALTER USER jim IDENTIFIED BY 'XYZ@@123' REPLACE 'abcd@123';"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "修改用户 kim 的用户名为 tim",
+      "commands": [
+        "\\du",
+        "ALTER USER kim RENAME TO tim;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "删除用户 tim",
+      "commands": [
+        "drop user tim;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "创建角色 role1",
+      "commands": [
+        "CREATE ROLE role1 SYSADMIN IDENTIFIED BY 'role_123';",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "创建带有效期的角色 role2",
+      "commands": [
+        "CREATE ROLE role2 with PASSWORD 'role_456' VALID BEGIN '2022-12-4' VALID UNTIL '2022-12-30';",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "创建可登录的角色 role3",
+      "commands": [
+        "CREATE ROLE role3 LOGIN IDENTIFIED BY 'role_789';",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "修改角色 role1 名称为 role10",
+      "commands": [
+        "ALTER ROLE role1 RENAME TO role10;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "修改角色 role2 的密码",
+      "commands": [
+        "ALTER ROLE role2 IDENTIFIED BY 'role@123' replace 'role_456';"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "为角色 role2 增加登录权限",
+      "commands": [
+        "ALTER ROLE role2 LOGIN;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "一次性为角色 role2 增加多个权限",
+      "commands": [
+        "ALTER ROLE role2 CREATEDB CREATEROLE;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "角色权限授予",
+      "commands": [
+        "GRANT omm to role3 with admin option;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "角色权限撤销",
+      "commands": [
+        "revoke omm from role3;",
+        "\\du"
+      ],
+      "wait": 2.0
+    },
+    {
+      "caption": "删除角色 role10",
+      "commands": [
+        "DROP ROLE role10;",
+        "\\du"
+      ],
+      "wait": 2.0
+    }
+  ]
+}

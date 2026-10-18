@@ -1,0 +1,23 @@
+{
+  "library": "资料库",
+  "template": "模板\\实验报告手册.docx",
+  "output_dir": "",
+  "ssh_host": "<server-ip>",
+  "ssh_port": 22,
+  "ssh_user": "<user>",
+  "ssh_password": "",
+  "key_path": "~/.ssh/id_ed25519",
+  "gsql_port": 5432,
+  "db_data_dir": "/opt/huawei/install/data/db",
+  "cols": 120,
+  "lines": 40,
+  "cover": {
+    "课程名称": "",
+    "姓名": "",
+    "学号": "",
+    "专业": "",
+    "班级": "",
+    "时间": "",
+    "地点": ""
+  }
+}

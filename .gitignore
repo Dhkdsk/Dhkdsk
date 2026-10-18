@@ -1,0 +1,15 @@
+# 运行产物 / 本地配置
+config.json
+*.log
+shots/
+dist/
+build/
+*.exe
+.profile/
+__pycache__/
+*.pyc
+
+# 不随仓库分发的内容
+资料库/
+模板/
+lab-output/
