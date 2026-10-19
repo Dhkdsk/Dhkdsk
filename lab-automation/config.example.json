@@ -11,6 +11,8 @@
   "db_data_dir": "/opt/huawei/install/data/db",
   "cols": 120,
   "lines": 40,
+  "scanner_script": "",
+  "scanner_python": "",
   "cover": {
     "课程名称": "",
     "姓名": "",

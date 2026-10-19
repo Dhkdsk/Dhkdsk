@@ -7,6 +7,8 @@ import re
 import sys
 import json
 import queue
+import shutil
+import subprocess
 import threading
 import traceback
 import tkinter as tk
@@ -43,14 +45,10 @@ DEFAULT_CONFIG = {
     "gsql_port": 5432,
     "db_data_dir": "/opt/huawei/install/data/db",
     "cols": 120, "lines": 40,
+    "scanner_script": "", "scanner_python": "",
     "cover": {
-        "课程名称": "openGauss 数据库管理",
-        "姓名": "",
-        "学号": "",
-        "专业": "计算机应用工程",
-        "班级": "",
-        "时间": "",
-        "地点": "",
+        "课程名称": "", "姓名": "", "学号": "", "专业": "",
+        "班级": "", "时间": "", "地点": "",
     },
 }
 
@@ -161,6 +159,149 @@ def parse_manual(md_text):
     return steps
 
 
+GSQL_PROMPT_RE = re.compile(r'^\s*[A-Za-z_][\w.]*\s*=\s*#\s?')
+SHELL_PROMPT_RE = re.compile(r'^\s*(?:\[[^\]]+\][#$]|[\w.-]+@[\w.-]+:[^#$]*[#$])\s?')
+SQL_SKIP_RE = re.compile(
+    r'^(?:ssh\s|su\s+-\s|gs_om\b|gsql\b|gs_[a-z]|exit\b|\\q\b|\\!|vi\b|vim\b|nano\b|'
+    r'yum\b|dnf\b|apt\b|cd\b|tar\b|chown\b|chmod\b|mkdir\b|rm\b|cp\b|mv\b|cat\b|'
+    r'echo\b|export\b|source\b|make\b|rpm\b|java\b|ping\b|systemctl\b|service\b|mysql\b)', re.I)
+SQL_END_RE = re.compile(r';\s*(?:--.*)?$')
+MYSQL_STMT_RE = re.compile(r'`|AUTO_INCREMENT|ENGINE\s*=|FOREIGN_KEY_CHECKS|SET\s+NAMES\b|utf8mb4', re.I)
+
+
+def clean_manual(md_text):
+    """把平台手册清洗成可自动执行的 gsql 步骤。
+
+    规则：
+      - 只保留 gsql 提示符（openGauss=# / db1=# …）下的 SQL 与 \\ 元命令；
+      - Shell/OS 命令（[root@…]#、vi、yum、cd、gs_om …）一律丢弃；
+      - 多行 SQL 合并成一条；相同 SQL 只保留一次；
+      - 自动生成 DROP DATABASE / DROP USER 的 setup，便于重复运行。
+    返回 (steps, setup)
+    """
+    lines = md_text.splitlines()
+    start = 0
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("## 实验介绍"):
+            start = i
+            break
+    body = lines[start:]
+    for i, ln in enumerate(body):
+        if ln.strip().startswith("## 附"):
+            body = body[:i]
+            break
+
+    steps, seen_sql = [], set()
+    caption, fence, mode, buf = "", False, None, []
+
+    def finalize():
+        nonlocal buf, mode, caption
+        if not buf:
+            mode = None
+            return
+        cmd = "\n".join(x.rstrip() for x in buf).strip()
+        buf, mode = [], None
+        if not cmd or SQL_SKIP_RE.match(cmd):
+            return
+        if not cmd.startswith("\\") and MYSQL_STMT_RE.search(cmd):
+            return
+        if cmd.startswith("\\"):
+            if cmd in ("\\q",) or cmd.startswith("\\!"):
+                return
+            steps.append({"caption": caption or ("步骤 %d" % (len(steps) + 1)),
+                          "commands": [cmd], "wait": 2.0})
+            return
+        norm = re.sub(r'\s+', ' ', cmd).strip()
+        if not SQL_END_RE.search(norm):
+            cmd += ";"
+            norm += ";"
+        if norm in seen_sql:
+            return
+        seen_sql.add(norm)
+        steps.append({"caption": caption or ("步骤 %d" % (len(steps) + 1)),
+                      "commands": [cmd], "wait": 2.2 if "\n" in cmd else 2.0})
+
+    def add_meta(c):
+        nonlocal caption
+        c = c.strip()
+        if not c or c in ("\\q",) or c.startswith("\\!") or SQL_SKIP_RE.match(c):
+            return
+        steps.append({"caption": caption or ("步骤 %d" % (len(steps) + 1)),
+                      "commands": [c], "wait": 2.0})
+
+    for raw in body:
+        s = raw.rstrip()
+        st = s.strip()
+        if st.startswith("```"):
+            finalize()
+            fence = not fence
+            continue
+        if not st:
+            if mode == "shell":
+                mode = None
+            continue
+        m = re.match(r'^(#{1,6})\s+(.+)$', st)
+        if m and not fence:
+            finalize(); mode = None
+            caption = m.group(2).strip()
+            continue
+        m = re.match(r'^\*\*(.+?)\*\*$', st)
+        if m and not fence:
+            finalize(); mode = None
+            caption = m.group(1).strip()
+            continue
+        if re.match(r'^\s*mysql>', s):
+            finalize(); mode = None
+            continue
+        if GSQL_PROMPT_RE.match(s):
+            finalize()
+            content = GSQL_PROMPT_RE.sub('', s).strip()
+            if not content:
+                continue
+            if content.startswith("\\"):
+                add_meta(content)
+            else:
+                buf, mode = [content], "sql"
+                if SQL_END_RE.search(content):
+                    finalize()
+            continue
+        if SHELL_PROMPT_RE.match(s):
+            finalize(); mode = "shell"
+            continue
+        if mode == "sql":
+            if fence or raw.startswith("    ") or raw.startswith("\t"):
+                buf.append(st)
+                if SQL_END_RE.search(st):
+                    finalize()
+                continue
+            finalize()
+        if mode == "shell":
+            if raw.startswith("    ") or raw.startswith("\t"):
+                continue
+            mode = None
+        if st.startswith("![") or st.startswith("|") or st.startswith(">"):
+            continue
+        if len(st) <= 30 and (st.endswith("：") or st.endswith(":")):
+            caption = st.rstrip("：:。")
+
+    finalize()
+
+    dbs, users = [], []
+    for st in steps:
+        for c in st["commands"]:
+            dbs += re.findall(r'\bCREATE\s+DATABASE\s+([A-Za-z_]\w*)', c, re.I)
+            dbs += [m[1] for m in re.findall(
+                r'\bALTER\s+DATABASE\s+([A-Za-z_]\w*)\s+RENAME\s+TO\s+([A-Za-z_]\w*)', c, re.I)]
+            users += re.findall(r'\bCREATE\s+(?:USER|ROLE)\s+([A-Za-z_]\w*)', c, re.I)
+    setup = []
+    for n in dict.fromkeys(dbs):
+        if n.lower() != "postgres":
+            setup.append("DROP DATABASE IF EXISTS %s;" % n)
+    for u in dict.fromkeys(users):
+        setup.append("DROP USER IF EXISTS %s CASCADE;" % u)
+    return steps, setup
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -182,9 +323,10 @@ class App:
         top = ttk.Frame(self.root, padding=6); top.pack(fill="x")
         ttk.Label(top, text="资料库:").pack(side="left")
         self.var_lib = tk.StringVar(value=self.cfg["library"])
-        ttk.Entry(top, textvariable=self.var_lib, width=70).pack(side="left", padx=4)
+        ttk.Entry(top, textvariable=self.var_lib, width=52).pack(side="left", padx=4)
         ttk.Button(top, text="浏览", command=self.pick_lib).pack(side="left")
-        ttk.Button(top, text="扫描", command=self.scan_library).pack(side="left", padx=4)
+        ttk.Button(top, text="重扫", command=self.scan_library).pack(side="left", padx=4)
+        ttk.Button(top, text="扫描平台", command=self.do_scan_platform).pack(side="left")
         ttk.Button(top, text="环境检测", command=self.do_envcheck).pack(side="right", padx=4)
         ttk.Button(top, text="设置", command=self.open_settings).pack(side="right")
 
@@ -198,6 +340,7 @@ class App:
         self.lst.pack(side="left", fill="both", expand=True)
         lb_sb.pack(side="right", fill="y")
         self.lst.bind("<<ListboxSelect>>", self.on_select)
+        ttk.Button(lf, text="删除选中实验", command=self.del_experiments).pack(fill="x", pady=(4, 0))
         mid.add(lf, weight=1)
 
         rf = ttk.LabelFrame(mid, text="步骤（双击编辑）", padding=4)
@@ -215,7 +358,8 @@ class App:
         self.tree.bind("<MouseWheel>", lambda e: self.tree.yview_scroll(int(-e.delta / 120), "units"))
         self.lst.bind("<MouseWheel>", lambda e: self.lst.yview_scroll(int(-e.delta / 120), "units"))
         btns = ttk.Frame(rf); btns.pack(fill="x", pady=4)
-        for t, c in [("解析手册", self.gen_draft), ("添加", self.add_step), ("编辑", self.edit_step),
+        for t, c in [("清洗", self.clean_current), ("全部清洗", self.clean_all),
+                     ("添加", self.add_step), ("编辑", self.edit_step),
                      ("删除", self.del_step), ("上移", lambda: self.move(-1)), ("下移", lambda: self.move(1)),
                      ("保存步骤", self.save_steps)]:
             ttk.Button(btns, text=t, command=c).pack(side="left", padx=2)
@@ -229,7 +373,9 @@ class App:
         self.prog = ttk.Progressbar(bottom, length=260); self.prog.pack(side="left", padx=10)
 
         self.log = tk.Text(self.root, height=9); self.log.pack(fill="both", padx=6, pady=(0, 6))
-        self._log("就绪。先「扫描」→ 选实验 →「解析手册」→ 「开始生成报告」。")
+        logbar = ttk.Frame(self.root); logbar.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(logbar, text="清空日志", command=self.clear_log).pack(side="right")
+        self._log("就绪。流程：① 扫描平台 → ② 清洗 → ③ 开始生成报告。")
 
         # 启动自检（仅本地，避免频繁远程连接）
         def work():
@@ -242,6 +388,9 @@ class App:
 
     def _log(self, msg):
         self.log.insert("end", str(msg) + "\n"); self.log.see("end")
+
+    def clear_log(self):
+        self.log.delete("1.0", "end")
 
     def post(self, fn, *a):
         self.q.put((fn, a))
@@ -265,7 +414,8 @@ class App:
         w = tk.Toplevel(self.root); w.title("设置"); w.grab_set()
         fields = [("ssh_host", "SSH 主机"), ("ssh_port", "SSH 端口"), ("ssh_user", "SSH 用户"),
                   ("ssh_password", "SSH 密码"), ("gsql_port", "gsql 端口"),
-                  ("db_data_dir", "openGauss 数据目录"), ("template", "Word 模板"), ("output_dir", "输出目录")]
+                  ("db_data_dir", "openGauss 数据目录"), ("template", "Word 模板"), ("output_dir", "输出目录"),
+                  ("scanner_script", "平台扫描脚本 scan.py"), ("scanner_python", "扫描用 Python")]
         ent = {}
         for i, (k, lab) in enumerate(fields):
             ttk.Label(w, text=lab).grid(row=i, column=0, sticky="e", padx=6, pady=3)
@@ -323,6 +473,154 @@ class App:
                 self.experiments.append({"dir": None, "name": name, "testId": tid, "md": None})
                 self.lst.insert("end", name)
         self._log("扫描到 %d 个实验" % len(self.experiments))
+
+    def del_experiments(self):
+        sel = self.lst.curselection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在左侧选择要删除的实验（可 Ctrl/Shift 多选）")
+            return
+        exps = [self.experiments[i] for i in sel]
+        names = "\n".join("· " + e["name"] for e in exps[:10])
+        if len(exps) > 10:
+            names += "\n… 共 %d 个" % len(exps)
+        if not messagebox.askyesno("确认删除",
+                                   "将删除以下实验的扫描目录和步骤文件，不可恢复：\n\n"
+                                   + names + "\n\n继续？"):
+            return
+        lib = self.var_lib.get().strip()
+        lib_abs = os.path.abspath(lib if os.path.isabs(lib) else os.path.join(BASE, lib))
+        n = 0
+        for exp in exps:
+            tid = exp["testId"]
+            d = exp.get("dir")
+            if d and os.path.isdir(d):
+                try:
+                    if os.path.commonpath([os.path.abspath(d), lib_abs]) == lib_abs:
+                        shutil.rmtree(d, ignore_errors=True)
+                except ValueError:
+                    pass
+            for p in (os.path.join(STEPS_DIR, tid + ".json"), os.path.join(SHOTS_DIR, tid)):
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    elif os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            n += 1
+        self.current = None
+        self.steps = []
+        self.setup = []
+        self.refresh_tree()
+        self.scan_library()
+        self._log("已删除 %d 个实验" % n)
+
+    # ------------------------------------------------------------ 平台扫描
+    def scanner_script(self):
+        p = str(self.cfg.get("scanner_script") or "")
+        if p and os.path.exists(p):
+            return p
+        for cand in (os.path.join(os.path.dirname(BASE), "远程实验环境自动化工具链-扫描工具", "scan.py"),
+                     os.path.join(os.path.dirname(BASE), "scanner", "scan.py"),
+                     os.path.join(BASE, "scanner", "scan.py")):
+            if os.path.exists(cand):
+                return cand
+        return ""
+
+    def scanner_python(self):
+        p = str(self.cfg.get("scanner_python") or "")
+        if p and os.path.exists(p):
+            return p
+        if not getattr(sys, "frozen", False):
+            return sys.executable
+        for cand in (r"D:\python\python.exe", r"C:\Program Files\Python312\python.exe",
+                     r"C:\Program Files\Python311\python.exe"):
+            if os.path.exists(cand):
+                return cand
+        return "python"
+
+    def set_library(self, path):
+        self.var_lib.set(path)
+        self.cfg["library"] = path
+        save_config(self.cfg)
+        self.scan_library()
+
+    def do_scan_platform(self):
+        script = self.scanner_script()
+        if not script:
+            messagebox.showerror("扫描平台", "找不到 scan.py。请在「设置」里填写扫描脚本路径。")
+            return
+        py = self.scanner_python()
+        cwd = os.path.dirname(script)
+        self._log("启动平台扫描：" + script)
+        self._log("  在弹出的窗口里人工登录；抓取完成关闭窗口后会自动刷新资料库。")
+        try:
+            proc = subprocess.Popen([py, script], cwd=cwd,
+                                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        except Exception as e:
+            messagebox.showerror("扫描平台", "启动失败：\n%r" % e)
+            return
+
+        def wait():
+            proc.wait()
+            self.post(self._log, "扫描窗口已关闭，正在刷新资料库…")
+            out = os.path.join(cwd, "lab-output")
+            if os.path.isdir(out):
+                self.post(self.set_library, out)
+            else:
+                self.post(self.scan_library)
+        threading.Thread(target=wait, daemon=True).start()
+
+    # ------------------------------------------------------------ 清洗
+    def clean_current(self):
+        if not self.current:
+            messagebox.showinfo("提示", "请先选择实验")
+            return
+        md = self.current.get("md")
+        if not md or not os.path.exists(md):
+            messagebox.showinfo("提示", "该实验没有手册 md（来自内置步骤），无法清洗。")
+            return
+        if self.steps and not messagebox.askyesno("确认", "当前已有步骤，清洗将覆盖，继续？"):
+            return
+        text = open(md, encoding="utf-8").read()
+        self.steps, self.setup = clean_manual(text)
+        self.refresh_tree()
+        self.save_steps()
+        self._log("清洗完成：%d 步，setup %d 条（已保存）" % (len(self.steps), len(self.setup)))
+        if not self.steps:
+            messagebox.showwarning("清洗", "没有提取到 gsql 命令。该实验可能以 Shell/OS 操作为主。")
+
+    def clean_all(self):
+        if not self.experiments:
+            messagebox.showinfo("提示", "资料库为空，请先扫描平台。")
+            return
+        if not messagebox.askyesno("确认", "将清洗全部有手册的实验，并覆盖对应 steps 文件，继续？"):
+            return
+        n_ok = n_empty = 0
+        for exp in self.experiments:
+            md = exp.get("md")
+            if not md or not os.path.exists(md):
+                continue
+            try:
+                text = open(md, encoding="utf-8").read()
+                steps, setup = clean_manual(text)
+            except Exception as e:
+                self._log("清洗失败：%s -> %r" % (exp["name"], e))
+                continue
+            if not steps:
+                n_empty += 1
+                self._log("  %s：无 gsql 命令（已跳过）" % exp["name"])
+                continue
+            os.makedirs(STEPS_DIR, exist_ok=True)
+            json.dump({"testId": exp["testId"], "name": exp["name"],
+                       "setup": setup, "capture_stop": True, "steps": steps},
+                      open(os.path.join(STEPS_DIR, exp["testId"] + ".json"), "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=2)
+            n_ok += 1
+            self._log("  %s：%d 步" % (exp["name"], len(steps)))
+        self._log("全部清洗完成：成功 %d，跳过 %d" % (n_ok, n_empty))
+        if self.current:
+            self.load_steps()
 
     def on_select(self, _=None):
         sel = self.lst.curselection()
@@ -410,7 +708,7 @@ class App:
             return
         os.makedirs(STEPS_DIR, exist_ok=True)
         json.dump({"testId": self.current["testId"], "name": self.current["name"],
-                   "setup": self.setup, "steps": self.steps},
+                   "setup": self.setup, "capture_stop": True, "steps": self.steps},
                   open(self.steps_file(), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         self._log("步骤已保存：" + self.steps_file())
 

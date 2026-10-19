@@ -10,11 +10,13 @@
 
 | 目录 | 说明 |
 |---|---|
-| `lab-automation/` | 主程序：tkinter GUI + 远程终端执行 + Word 生成 |
-| `scanner/` | 独立扫描脚本：从平台抓取手册与图片（Playwright） |
+| `lab-automation/` | 主程序：tkinter GUI + 清洗 + 远程终端执行 + Word 生成 |
+| `scanner/` | 扫描脚本：从平台抓取手册与图片（也可由主程序一键调用） |
 
 ## 核心特性
 
+- **一体化流水线**：一个 GUI 串起「扫描平台 → 清洗手册 → 生成报告」。
+- **清洗规则**：只保留 gsql 提示符下的 SQL 与 `\` 元命令，丢弃 Shell/OS 命令，多行合并、自动去重，并生成可重复运行的清理 `setup`。
 - **真实终端执行**：SSH 驱动真实终端窗口，通过 Windows 控制台 API 注入按键、读屏同步，并用 `PrintWindow` 抓取窗口自身像素（不受其它窗口遮挡）。
 - **绕过证书限制**：针对服务器证书缺失 SAN 的场景，扫描端使用 Playwright `ignore_https_errors` 在应用层规避，免代理、免安装 CA。
 - **配置驱动**：每个实验的步骤以 JSON 定义（`steps/*.json`），可编辑、可复用。
