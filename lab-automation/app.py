@@ -74,7 +74,10 @@ def save_config(cfg):
             out["ssh_password"] = engine.dpapi_encrypt(out["ssh_password"])
     except Exception:
         pass
-    json.dump(out, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 PROMPT_RE = re.compile(r'^\s*(?:\[[^\]]+\]\s*)?(?:[\w.\-]+=\s*)?[#$]\s*')
@@ -161,6 +164,9 @@ def parse_manual(md_text):
 
 GSQL_PROMPT_RE = re.compile(r'^\s*[A-Za-z_][\w.]*\s*=\s*#\s?')
 SHELL_PROMPT_RE = re.compile(r'^\s*(?:\[[^\]]+\][#$]|[\w.-]+@[\w.-]+:[^#$]*[#$])\s?')
+KEEP_SHELL_RE = re.compile(
+    r'^(?:gs_checkperf\b|gs_checkos\b|gs_check\b|gs_collector\b|gs_dump\b|gs_restore\b|'
+    r'gs_guc\s+(?:set|check)\b|gs_ctl\s+status\b|gs_om\s+-t\s+status\b)', re.I)
 SQL_SKIP_RE = re.compile(
     r'^(?:ssh\s|su\s+-\s|gs_om\b|gsql\b|gs_[a-z]|exit\b|\\q\b|\\!|vi\b|vim\b|nano\b|'
     r'yum\b|dnf\b|apt\b|cd\b|tar\b|chown\b|chmod\b|mkdir\b|rm\b|cp\b|mv\b|cat\b|'
@@ -267,6 +273,10 @@ def clean_manual(md_text):
             continue
         if SHELL_PROMPT_RE.match(s):
             finalize(); mode = "shell"
+            content = SHELL_PROMPT_RE.sub('', s).strip()
+            if content and KEEP_SHELL_RE.match(content):
+                steps.append({"caption": caption or ("步骤 %d" % (len(steps) + 1)),
+                              "commands": [content], "wait": 3.0})
             continue
         if mode == "sql":
             if fence or raw.startswith("    ") or raw.startswith("\t"):
@@ -310,6 +320,7 @@ class App:
         self.current = None
         self.steps = []
         self.setup = []
+        self.capture_stop = True
         self.q = queue.Queue()
         self._build()
         self.scan_library()
@@ -366,7 +377,7 @@ class App:
         mid.add(rf, weight=2)
 
         bottom = ttk.Frame(self.root, padding=6); bottom.pack(fill="x")
-        self.btn_init = ttk.Button(bottom, text="① 环境修复与初始化", command=self.do_init)
+        self.btn_init = ttk.Button(bottom, text="① 环境+数据库初始化", command=self.do_init)
         self.btn_init.pack(side="left")
         self.btn_run = ttk.Button(bottom, text="② 开始生成报告", command=self.do_run)
         self.btn_run.pack(side="left", padx=6)
@@ -375,7 +386,7 @@ class App:
         self.log = tk.Text(self.root, height=9); self.log.pack(fill="both", padx=6, pady=(0, 6))
         logbar = ttk.Frame(self.root); logbar.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(logbar, text="清空日志", command=self.clear_log).pack(side="right")
-        self._log("就绪。流程：① 扫描平台 → ② 清洗 → ③ 开始生成报告。")
+        self._log("就绪。流程：扫描平台 → 选实验/清洗 → ① 环境+数据库初始化 → ② 开始生成报告。")
 
         # 启动自检（仅本地，避免频繁远程连接）
         def work():
@@ -413,7 +424,7 @@ class App:
     def open_settings(self):
         w = tk.Toplevel(self.root); w.title("设置"); w.grab_set()
         fields = [("ssh_host", "SSH 主机"), ("ssh_port", "SSH 端口"), ("ssh_user", "SSH 用户"),
-                  ("ssh_password", "SSH 密码"), ("gsql_port", "gsql 端口"),
+                  ("ssh_password", "SSH 密码"), ("key_path", "SSH 私钥路径"), ("gsql_port", "gsql 端口"),
                   ("db_data_dir", "openGauss 数据目录"), ("template", "Word 模板"), ("output_dir", "输出目录"),
                   ("scanner_script", "平台扫描脚本 scan.py"), ("scanner_python", "扫描用 Python")]
         ent = {}
@@ -432,9 +443,12 @@ class App:
             cent[k] = v
         def ok():
             for k, v in ent.items():
-                val = v.get()
+                val = v.get().strip()
                 if k in ("ssh_port", "gsql_port"):
-                    val = int(val)
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        messagebox.showerror("设置", "%s 必须是数字" % k); return
                 self.cfg[k] = val
             self.cfg["cover"] = {k: cent[k].get() for k in ck}
             save_config(self.cfg); w.destroy(); self._log("设置已保存")
@@ -584,6 +598,7 @@ class App:
             return
         text = open(md, encoding="utf-8").read()
         self.steps, self.setup = clean_manual(text)
+        self.capture_stop = True
         self.refresh_tree()
         self.save_steps()
         self._log("清洗完成：%d 步，setup %d 条（已保存）" % (len(self.steps), len(self.setup)))
@@ -626,8 +641,19 @@ class App:
         sel = self.lst.curselection()
         if not sel:
             return
-        self.current = self.experiments[sel[0]]
+        exp = self.experiments[sel[0]]
+        if self.current is not None and self.current.get("testId") != exp.get("testId"):
+            self._autosave()
+        self.current = exp
         self.load_steps()
+
+    def _autosave(self):
+        """编辑后立即落盘，避免切换实验/开始采集时丢失。"""
+        try:
+            if self.current and self.steps is not None:
+                self.save_steps(quiet=True)
+        except Exception as e:
+            self._log("自动保存失败：" + repr(e))
 
     def steps_file(self):
         return os.path.join(STEPS_DIR, (self.current["testId"] if self.current else "x") + ".json")
@@ -635,12 +661,14 @@ class App:
     def load_steps(self):
         self.steps = []
         self.setup = []
+        self.capture_stop = True
         fp = self.steps_file()
         if os.path.exists(fp):
             try:
                 data = json.load(open(fp, encoding="utf-8"))
                 self.steps = data.get("steps", [])
                 self.setup = data.get("setup", [])
+                self.capture_stop = bool(data.get("capture_stop", True))
                 self._log("已载入已保存步骤：" + fp)
             except Exception:
                 pass
@@ -665,8 +693,11 @@ class App:
         self._log("已解析手册生成 %d 个步骤草稿，请检查/编辑后保存" % len(self.steps))
 
     def add_step(self):
+        if not self.current:
+            messagebox.showinfo("提示", "请先选择实验"); return
         self.steps.append({"caption": "新步骤", "commands": ["SELECT 1;"], "wait": 2.0})
         self.refresh_tree()
+        self._autosave()
 
     def edit_step(self, _=None):
         sel = self.tree.selection()
@@ -684,13 +715,13 @@ class App:
             st["caption"] = cap.get("1.0", "end").strip()
             chunks = re.split(r"\n\s*\n", cmd.get("1.0", "end"))
             st["commands"] = [c.strip() for c in chunks if c.strip()]
-            w.destroy(); self.refresh_tree()
+            w.destroy(); self.refresh_tree(); self._autosave()
         ttk.Button(w, text="确定", command=ok).grid(row=2, column=1, sticky="e", pady=6)
 
     def del_step(self):
         sel = self.tree.selection()
         if sel:
-            del self.steps[int(sel[0]) - 1]; self.refresh_tree()
+            del self.steps[int(sel[0]) - 1]; self.refresh_tree(); self._autosave()
 
     def move(self, d):
         sel = self.tree.selection()
@@ -702,15 +733,17 @@ class App:
             self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
             self.refresh_tree()
             self.tree.selection_set(str(j + 1))
+            self._autosave()
 
-    def save_steps(self):
+    def save_steps(self, quiet=False):
         if not self.current:
             return
         os.makedirs(STEPS_DIR, exist_ok=True)
         json.dump({"testId": self.current["testId"], "name": self.current["name"],
-                   "setup": self.setup, "capture_stop": True, "steps": self.steps},
+                   "setup": self.setup, "capture_stop": self.capture_stop, "steps": self.steps},
                   open(self.steps_file(), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-        self._log("步骤已保存：" + self.steps_file())
+        if not quiet:
+            self._log("步骤已保存：" + self.steps_file())
 
     # ------------------------------------------------------------ actions
     def do_envcheck(self):
@@ -746,13 +779,37 @@ class App:
         return t if os.path.isabs(t) else os.path.join(BASE, t)
 
     def _cfg_check(self):
-        c = dict(self.cfg); c["template"] = self.tpl(); return c
+        c = dict(self.cfg); c["template"] = self.tpl()
+        lib = c.get("library", "")
+        if lib and not os.path.isabs(lib):
+            c["library"] = os.path.join(BASE, lib)
+        return c
+
+    def _set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        self.btn_init.config(state=state)
+        self.btn_run.config(state=state)
 
     def do_init(self):
-        self.btn_init.config(state="disabled")
-        threading.Thread(target=self._init_worker, daemon=True).start()
+        self._autosave()
+        sel = list(self.lst.curselection())
+        names = [self.experiments[i]["name"] for i in sel if i < len(self.experiments)]
+        if names:
+            preview = "\n".join("· " + n for n in names[:12])
+            if len(names) > 12:
+                preview += "\n… 共 %d 个" % len(names)
+            if not messagebox.askyesno(
+                    "环境+数据库初始化",
+                    "将先修复环境，然后对所选实验执行数据库初始化：\n"
+                    "运行 steps 中的 setup（可能 DROP 对应数据库/用户，不可恢复）。\n\n"
+                    + preview + "\n\n继续？"):
+                return
+        else:
+            self._log("未选择实验：仅做环境修复/初始化，不清理数据库。")
+        self._set_busy(True)
+        threading.Thread(target=self._init_worker, args=(sel,), daemon=True).start()
 
-    def _init_worker(self):
+    def _init_worker(self, idxs=()):
         L = lambda m: self.post(self._log, m)
         try:
             L("环境修复/初始化：检查本机 OpenSSH…")
@@ -773,6 +830,7 @@ class App:
             if env.get("data_dir"):
                 self.cfg["db_data_dir"] = env["data_dir"]
 
+            db_ready = False
             if not env.get("installed"):
                 L("未检测到 openGauss（未找到 gsql）。请在服务器安装：openGauss 官方安装包 + simpleInstall，"
                   "或把 gsql 加入 PATH 后重试。")
@@ -783,20 +841,51 @@ class App:
                                               self.cfg["ssh_password"], self.cfg["db_data_dir"], log=L)
                 except Exception as e:
                     L("设置数据库免密失败：" + repr(e))
-                engine.ensure_remote_running(ssh, self.cfg.get("ssh_password") or None,
-                                             self.cfg["db_data_dir"], log=L)
+                db_ready = engine.ensure_remote_running(ssh, self.cfg.get("ssh_password") or None,
+                                                        self.cfg["db_data_dir"], log=L,
+                                                        port=int(self.cfg.get("gsql_port") or 5432))
             self.post(save_config, self.cfg)
+
+            if idxs:
+                if not db_ready:
+                    L("数据库未就绪，跳过数据库初始化。")
+                else:
+                    L("数据库初始化：收集所选实验的 setup…")
+                    stmts = []
+                    for idx in idxs:
+                        if idx >= len(self.experiments):
+                            continue
+                        exp = self.experiments[idx]
+                        _, setup, _ = self._load_steps_for(exp)
+                        if setup:
+                            L("  %s：%d 条" % (exp["name"], len(setup)))
+                            stmts += setup
+                        else:
+                            L("  %s：无 setup（未清理）" % exp["name"])
+                    if stmts:
+                        ok = engine.reset_databases(ssh, self.cfg.get("ssh_password") or None,
+                                                    port=int(self.cfg.get("gsql_port") or 5432),
+                                                    statements=stmts, log=L)
+                        L("数据库初始化" + ("完成 √" if ok else "部分失败（见上）"))
+                    else:
+                        L("数据库初始化：没有需要清理的对象 √")
             L("初始化完成 √")
         except Exception as e:
             L("初始化失败：" + repr(e)); L(traceback.format_exc())
         finally:
-            self.post(lambda: self.btn_init.config(state="normal"))
+            self.post(self._set_busy, False)
 
     def do_run(self):
         sel = self.lst.curselection()
         if not sel:
             messagebox.showinfo("提示", "请选择实验"); return
-        self.btn_run.config(state="disabled")
+        try:
+            os.makedirs(self.cfg.get("output_dir") or ".", exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("输出目录", "无法创建输出目录：\n%r" % e); return
+        self._autosave()      # 采集读取的是磁盘 steps，先确保最新编辑已写入
+        self.prog.config(value=0)
+        self._set_busy(True)
         threading.Thread(target=self._run_worker, args=(list(sel),), daemon=True).start()
 
     def _load_steps_for(self, exp):
@@ -810,40 +899,52 @@ class App:
         return [], [], True
 
     def _run_worker(self, idxs):
+        ok = fail = 0
         try:
             for n, idx in enumerate(idxs, 1):
-                exp = self.experiments[idx]
-                steps, setup, capture_stop = self._load_steps_for(exp)
-                if not steps:
-                    self.post(self._log, "[%d/%d] 跳过（无步骤）：%s" % (n, len(idxs), exp["name"]))
-                    continue
-                self.post(self._log, "[%d/%d] 开始采集：%s" % (n, len(idxs), exp["name"]))
-                workdir = os.path.join(SHOTS_DIR, exp["testId"])
-                os.makedirs(workdir, exist_ok=True)
-                engine.ensure_remote_running(self._ssh(), self.cfg.get("ssh_password") or None,
-                                             self.cfg.get("db_data_dir"), log=lambda m: self.post(self._log, m))
-                items = engine.run_capture(
-                    self._ssh(), int(self.cfg["gsql_port"]), steps, workdir, setup=setup,
-                    capture_stop=capture_stop,
-                    log=lambda m: self.post(self._log, m),
-                    progress=lambda p: self.post(self.prog.config, {"value": p}),
-                    db_data_dir=self.cfg["db_data_dir"], cols=int(self.cfg["cols"]), lines=int(self.cfg["lines"]))
-                purpose = "通过本次实验，熟悉并掌握 openGauss 数据库的基本操作方法，加深对相关概念的理解。"
-                device = "已安装 openGauss 的 Linux 服务器一台。通过 SSH 登录 omm 用户，使用 gsql 连接数据库（端口 %s），按实验步骤执行并观察结果。" % self.cfg["gsql_port"]
-                result = "按实验步骤依次执行各命令，结果均符合预期，具体命令与运行结果见 1.3 的截图。"
-                problem = "实验过程中个别命令首次执行报错，根据提示调整后重新执行即成功。"
-                feeling = "通过本次“%s”实验，掌握了 openGauss 的相关操作方法，提升了动手实践能力。" % exp["name"]
-                out = os.path.join(self.cfg["output_dir"], "%s_已填写.docx" % exp["name"].split(" ")[0])
-                engine.build_docx(self.tpl(), out, exp["name"], purpose, device, result, problem, feeling,
-                                  items, cover=self.cfg.get("cover"), log=lambda m: self.post(self._log, m))
-                self.post(self._log, "[%d/%d] 完成：%s" % (n, len(idxs), out))
-            self.post(self._log, "全部完成 √")
-            self.post(messagebox.showinfo, "完成", "报告已生成到：\n" + self.cfg["output_dir"])
-        except Exception as e:
-            self.post(self._log, "失败：" + repr(e))
-            self.post(self._log, traceback.format_exc())
+                name = "#%d" % n
+                try:
+                    exp = self.experiments[idx]
+                    name = exp["name"]
+                    steps, setup, capture_stop = self._load_steps_for(exp)
+                    if not steps:
+                        self.post(self._log, "[%d/%d] 跳过（无步骤）：%s" % (n, len(idxs), name))
+                        continue
+                    self.post(self._log, "[%d/%d] 开始采集：%s" % (n, len(idxs), name))
+                    workdir = os.path.join(SHOTS_DIR, exp["testId"])
+                    os.makedirs(workdir, exist_ok=True)
+                    engine.ensure_remote_running(self._ssh(), self.cfg.get("ssh_password") or None,
+                                                 self.cfg.get("db_data_dir"), log=lambda m: self.post(self._log, m),
+                                                 port=int(self.cfg.get("gsql_port") or 5432))
+                    items = engine.run_capture(
+                        self._ssh(), int(self.cfg["gsql_port"]), steps, workdir, setup=setup,
+                        capture_stop=capture_stop,
+                        log=lambda m: self.post(self._log, m),
+                        progress=lambda p: self.post(self.prog.config, {"value": p}),
+                        db_data_dir=self.cfg["db_data_dir"], cols=int(self.cfg["cols"]), lines=int(self.cfg["lines"]))
+                    purpose = "通过本次实验，熟悉并掌握 openGauss 数据库的基本操作方法，加深对相关概念的理解。"
+                    device = "已安装 openGauss 的 Linux 服务器一台。通过 SSH 登录 omm 用户，使用 gsql 连接数据库（端口 %s），按实验步骤执行并观察结果。" % self.cfg["gsql_port"]
+                    result = "按实验步骤依次执行各命令，结果均符合预期，具体命令与运行结果见 1.3 的截图。"
+                    problem = "实验过程中个别命令首次执行报错，根据提示调整后重新执行即成功。"
+                    feeling = "通过本次“%s”实验，掌握了 openGauss 的相关操作方法，提升了动手实践能力。" % exp["name"]
+                    out = os.path.join(self.cfg["output_dir"], "%s_已填写.docx" % exp["name"].split(" ")[0])
+                    engine.build_docx(self.tpl(), out, exp["name"], purpose, device, result, problem, feeling,
+                                      items, cover=self.cfg.get("cover"), log=lambda m: self.post(self._log, m))
+                    ok += 1
+                    self.post(self._log, "[%d/%d] 完成：%s" % (n, len(idxs), out))
+                except Exception as e:
+                    fail += 1
+                    self.post(self._log, "[%d/%d] 失败：%s -> %r" % (n, len(idxs), name, e))
+                    self.post(self._log, traceback.format_exc())
+            self.post(self._log, "全部结束：成功 %d，失败 %d" % (ok, fail))
+            if fail:
+                self.post(messagebox.showwarning, "部分完成",
+                          "成功 %d 个，失败 %d 个。\n详情见日志，已生成文件在：\n%s" %
+                          (ok, fail, self.cfg["output_dir"]))
+            else:
+                self.post(messagebox.showinfo, "完成", "报告已生成到：\n" + self.cfg["output_dir"])
         finally:
-            self.post(lambda: self.btn_run.config(state="normal"))
+            self.post(self._set_busy, False)
 
 
 if __name__ == "__main__":

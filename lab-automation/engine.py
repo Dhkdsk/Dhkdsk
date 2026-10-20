@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import shlex
 import subprocess
 import shutil
 from ctypes import wintypes
@@ -41,32 +42,44 @@ class _INPUT_RECORD(ctypes.Structure):
     _fields_ = [("EventType", wintypes.WORD), ("Event", _EVENT_UNION)]
 
 
-def write_input(pid, text, tries=3):
-    """向控制台窗口写入按键（真实键盘输入）。"""
+def _key_records(seg):
+    recs = []
+    for ch in seg:
+        enter = ch in "\r\n"
+        for d in (1, 0):
+            r = _INPUT_RECORD(); r.EventType = 1
+            r.Event.KeyEvent.bKeyDown = d; r.Event.KeyEvent.wRepeatCount = 1
+            r.Event.KeyEvent.wVirtualKeyCode = 0x0D if enter else 0
+            r.Event.KeyEvent.uChar.UnicodeChar = "\r" if enter else ch
+            recs.append(r)
+    return recs
+
+
+def write_input(pid, text, tries=3, chunk=480):
+    """向控制台窗口写入按键（真实键盘输入）。
+
+    控制台输入缓冲区有限（默认约 4K 事件），长文本一次性写入会失败。
+    这里分块写入并校验实际写入数量，避免“命令静默丢失”。
+    """
     for _ in range(tries):
         K32.FreeConsole()
         if K32.AttachConsole(pid):
             h = K32.CreateFileW("CONIN$", 0x80000000 | 0x40000000, 1 | 2, None, 3, 0, None)
-            recs = []
-            for ch in text:
-                if ch in "\r\n":
-                    for d in (1, 0):
-                        r = _INPUT_RECORD(); r.EventType = 1
-                        r.Event.KeyEvent.bKeyDown = d; r.Event.KeyEvent.wRepeatCount = 1
-                        r.Event.KeyEvent.wVirtualKeyCode = 0x0D
-                        r.Event.KeyEvent.uChar.UnicodeChar = "\r"
-                        recs.append(r)
-                else:
-                    for d in (1, 0):
-                        r = _INPUT_RECORD(); r.EventType = 1
-                        r.Event.KeyEvent.bKeyDown = d; r.Event.KeyEvent.wRepeatCount = 1
-                        r.Event.KeyEvent.wVirtualKeyCode = 0
-                        r.Event.KeyEvent.uChar.UnicodeChar = ch
-                        recs.append(r)
-            arr = (_INPUT_RECORD * len(recs))(*recs)
-            wr = wintypes.DWORD()
-            ok = K32.WriteConsoleInputW(h, arr, len(recs), ctypes.byref(wr))
-            K32.CloseHandle(h); K32.FreeConsole()
+            ok = True
+            try:
+                for i in range(0, len(text), chunk):
+                    recs = _key_records(text[i:i + chunk])
+                    if not recs:
+                        continue
+                    arr = (_INPUT_RECORD * len(recs))(*recs)
+                    wr = wintypes.DWORD()
+                    if (not K32.WriteConsoleInputW(h, arr, len(recs), ctypes.byref(wr))
+                            or wr.value != len(recs)):
+                        ok = False
+                        break
+                    time.sleep(0.05)
+            finally:
+                K32.CloseHandle(h); K32.FreeConsole()
             if ok:
                 return True
         time.sleep(0.3)
@@ -100,11 +113,15 @@ def find_title(sub):
     return None, None
 
 
-def find_pid(pid):
+def find_pid(pid, title="LABSHOT_APP"):
+    """优先按 PID 找控制台窗口；部分系统上终端窗口归属其它宿主，退回按标题匹配。"""
+    fallback = None
     for h, p, t, c in enum_windows():
         if p == pid and c == "ConsoleWindowClass":
             return h
-    return None
+        if fallback is None and title.lower() in t.lower():
+            fallback = h
+    return fallback
 
 
 def client_bbox(h):
@@ -128,6 +145,10 @@ def crop_content(img, pad=12, thr=60, edge=10):
     l, t, r, b = bb
     return img.crop((max(0, l - pad), max(0, t - pad),
                      min(img.width, r + pad), min(img.height, b + pad)))
+
+
+_PROMPT_LINE_RE = re.compile(
+    r'^\s*(?:\[[^\]]+\][#$]|[\w.-]+@[\w.-]+:[^#$]*[#$]|[A-Za-z_][\w.]*\s*=\s*#)\s*$')
 
 
 # ---------------------------------------------------------------- 控制台读屏（同步）
@@ -228,6 +249,29 @@ def grab_window(hwnd):
     return img.crop((ox, oy, ox + cr.right, oy + cr.bottom))
 
 
+_SHELL_CMD_RE = re.compile(
+    r'^\s*(?:sudo\b|su\s+-|gs_[a-z]|gsql\b|'
+    r'clear\b|cd\b|ls\b|pwd\b|cat\b|echo\b|printf\b|'
+    r'tar\b|gzip\b|gunzip\b|zip\b|unzip\b|bzip2\b|xz\b|'
+    r'mkdir\b|rm\b|rmdir\b|cp\b|mv\b|ln\b|touch\b|chmod\b|chown\b|chgrp\b|'
+    r'yum\b|dnf\b|rpm\b|apt\b|systemctl\b|service\b|'
+    r'vi\b|vim\b|nano\b|sed\b|awk\b|grep\b|egrep\b|find\b|'
+    r'ps\b|top\b|kill\b|free\b|df\b|du\b|iostat\b|vmstat\b|sar\b|uptime\b|'
+    r'uname\b|hostname\b|ss\b|netstat\b|ifconfig\b|ip\b|ping\b|'
+    r'java\b|python3?\b|wget\b|curl\b|scp\b|ssh\b|rsync\b|'
+    r'export\b|source\b|env\b|which\b|whereis\b|history\b|alias\b|'
+    r'useradd\b|userdel\b|passwd\b|groupadd\b|reboot\b|shutdown\b|'
+    r'sysctl\b|ulimit\b|crontab\b|setenforce\b|getenforce\b)', re.I)
+
+
+def is_shell_command(cmd):
+    """判断步骤命令是 Shell/OS 命令（gs_checkperf、ls 等）还是 gsql 命令。"""
+    c = str(cmd).strip()
+    if not c or c.startswith("\\"):
+        return False
+    return bool(_SHELL_CMD_RE.match(c))
+
+
 # ---------------------------------------------------------------- 远端（paramiko）
 def _ssh(host, port, user, password=None, key=None, timeout=25):
     import paramiko
@@ -258,6 +302,8 @@ def check_environment(cfg, remote=False):
     checks.append(("ssh-keygen.exe", bool(kg), kg or "未找到"))
     conhost = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "conhost.exe")
     checks.append(("conhost.exe", os.path.exists(conhost), conhost))
+    kp = cfg.get("key_path", "")
+    checks.append(("SSH 私钥", bool(kp) and os.path.exists(kp), kp or "未配置（可点「① 环境修复」生成）"))
     checks.append(("Word 模板", os.path.exists(cfg.get("template", "")), cfg.get("template", "")))
     checks.append(("资料库目录", os.path.isdir(cfg.get("library", "")), cfg.get("library", "")))
     checks.append(("输出目录", os.path.isdir(cfg.get("output_dir", "")), cfg.get("output_dir", "")))
@@ -285,7 +331,17 @@ def check_environment(cfg, remote=False):
             elif line.startswith("GAUSSDATA="):
                 data_dir = line.split("=", 1)[1].strip()
         checks.append(("远端 openGauss 已安装", bool(gsql), gsql or "未找到 gsql，可点「环境修复」"))
-        run, _ = remote_run(c, "ss -tln 2>/dev/null | grep -E ':(5432|26000)' | head -1")
+        sudo_out, _ = remote_run(c, "sudo -n -u omm bash -lc 'true' 2>/dev/null "
+                                    "&& echo SUDO_OK || echo SUDO_NO")
+        sudo_ok = "SUDO_OK" in sudo_out
+        checks.append(("免密 sudo 到 omm", sudo_ok,
+                       "可用" if sudo_ok else "需要密码，采集会卡在 sudo 输入处"))
+        try:
+            port = int(cfg.get("gsql_port") or 5432)
+        except Exception:
+            port = 5432
+        pat = "|".join(str(x) for x in sorted({port, 5432, 26000}))
+        run, _ = remote_run(c, "ss -tln 2>/dev/null | grep -E ':(%s)' | head -1" % pat)
         checks.append(("远端 openGauss 运行中", bool(run.strip()), run.strip() or "未监听，可点「环境修复」启动"))
         c.close()
     except Exception as e:
@@ -296,13 +352,22 @@ def check_environment(cfg, remote=False):
 def ensure_ssh_key(host, port, user, password, key_path, log=print):
     """确保本地存在密钥并已安装到服务器（使用密码一次性安装）。"""
     pub = key_path + ".pub"
-    if not (os.path.exists(key_path) and os.path.exists(pub)):
-        os.makedirs(os.path.dirname(key_path), exist_ok=True)
-        keygen = shutil.which("ssh-keygen") or "ssh-keygen"
+    keygen = shutil.which("ssh-keygen") or "ssh-keygen"
+    if not os.path.exists(key_path):
+        d = os.path.dirname(key_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
         subprocess.run([keygen, "-t", "ed25519", "-N", "", "-f", key_path,
                         "-C", "labshot"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log("已生成本地 SSH 密钥")
+    if not os.path.exists(pub):          # 只有私钥时从私钥导出公钥，避免 ssh-keygen 覆盖提示卡住
+        r = subprocess.run([keygen, "-y", "-f", key_path], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("无法从私钥导出公钥：" + (r.stderr or r.stdout).strip())
+        with open(pub, "w", encoding="utf-8") as f:
+            f.write(r.stdout.strip() + "\n")
+        log("已由私钥导出公钥")
     pubkey = open(pub, encoding="utf-8").read().strip()
     c = _ssh(host, port, user, password=password)
     try:
@@ -349,7 +414,8 @@ def run_capture(ssh, gsql_port, steps, workdir, setup=None, log=print, progress=
     # cmd /c 下若首字符是引号会错误解析；无空格则不加引号，否则用 call
     ssh_cmd = ('call "%s"' % ssh_exe) if " " in ssh_exe else ssh_exe
     inner = ('title %s & mode con: cols=%d lines=%d & %s -tt -o StrictHostKeyChecking=no '
-             '-o ServerAliveInterval=30 -i "%s" -p %d %s@%s'
+             '-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 '
+             '-i "%s" -p %d %s@%s'
              % (title, cols, lines, ssh_cmd, ssh["key_path"], ssh["port"], ssh["user"], ssh["host"]))
     before = set(h for h, _, _, c in enum_windows() if c == "ConsoleWindowClass")
     proc = subprocess.Popen(["conhost.exe", "cmd.exe", "/c", inner],
@@ -364,13 +430,15 @@ def run_capture(ssh, gsql_port, steps, workdir, setup=None, log=print, progress=
             break
         time.sleep(0.25)
     if not pid:
-        raise RuntimeError("无法找到终端窗口")
+        raise RuntimeError("无法找到终端窗口。请把系统「默认终端应用程序」设为「Windows 控制台主机」"
+                           "（conhost），不要使用 Windows Terminal 接管，然后重试。")
     U32.SetWindowPos(h, -1, 60, 20, 0, 0, 0x0001 | 0x0040)
     log("终端窗口已打开，等待登录…")
 
     results = []
 
     def shot(name):
+        name = re.sub(r'[^0-9A-Za-z_.-]', '_', str(name)) or "step"
         hh = None
         for _ in range(30):
             hh = find_pid(pid)
@@ -394,30 +462,120 @@ def run_capture(ssh, gsql_port, steps, workdir, setup=None, log=print, progress=
         p2 = os.path.join(crop, name + ".png"); crop_content(im).save(p2)
         return p2
 
-    try:
-        time.sleep(6)
-        write_input(pid, "sudo -u omm bash -l\r"); wait_settled(pid, settle=0.7, timeout=20, min_wait=1.5)
-        write_input(pid, "gs_ctl start -D %s -Z single_node -l %s/logfile\r" % (db_data_dir, db_data_dir))
-        wait_settled(pid, settle=1.0, timeout=90, min_wait=3)
-        write_input(pid, "gsql -d postgres -p %d -r\r" % gsql_port)
-        wait_settled(pid, settle=0.8, timeout=40, min_wait=2)
-        write_input(pid, "\\pset pager off\r")     # 关闭分页器，避免 --More-- 卡住
-        wait_settled(pid, settle=0.6, timeout=15, min_wait=0.8)
+    def send(text):
+        if not write_input(pid, text):
+            raise RuntimeError("向终端写入命令失败（窗口可能已关闭）：" + " ".join(text.split())[:80])
 
-        scr = read_console(pid)
-        if scr and (("failed to connect" in scr) or ("FATAL" in scr)):
-            raise RuntimeError("打开数据库失败（请检查数据库是否启动/端口是否正确）。屏幕内容：\n" + scr[-400:])
+    def screen():
+        return read_console(pid) or ""
+
+    def login_error(scr):
+        for k in ("Permission denied", "Connection refused", "Connection timed out",
+                  "Could not resolve", "Host key verification failed", "No route to host",
+                  "password:", "Password:", "[sudo] password for",
+                  "not in the sudoers file", "is not allowed to execute"):
+            if k in scr:
+                return k
+        return ""
+
+    def wait_prompt(timeout=35, min_wait=0.6):
+        """等到屏幕最后一行出现 shell 提示符，避免把命令打进密码提示/连接中。"""
+        t0, scr = time.time(), ""
+        while time.time() - t0 < timeout:
+            scr = screen()
+            lines = [x.rstrip() for x in scr.splitlines() if x.strip()]
+            if (time.time() - t0) >= min_wait and lines and re.search(r'[#$>]\s*$', lines[-1]):
+                return True, scr
+            time.sleep(0.2)
+        return False, scr
+
+    def wait_omm_prompt(timeout=20):
+        """确认已经切换到 omm 用户（提示符以 [omm@ 开头）。"""
+        t0, scr = time.time(), ""
+        while time.time() - t0 < timeout:
+            scr = screen()
+            lines = [x.rstrip() for x in scr.splitlines() if x.strip()]
+            if lines and re.match(r'^\s*\[omm@[^\]]*\][#$]\s*$', lines[-1]):
+                return True, scr
+            if login_error(scr):
+                return False, scr
+            time.sleep(0.2)
+        return False, scr
+
+    def wait_gsql_prompt(timeout=45):
+        """等到 gsql 提示符（openGauss=# / db1=#），而不是 shell 提示符。"""
+        t0, scr = time.time(), ""
+        while time.time() - t0 < timeout:
+            scr = screen()
+            lines = [x.rstrip() for x in scr.splitlines() if x.strip()]
+            if lines and re.match(r'^[A-Za-z_][\w.]*\s*=\s*#', lines[-1]):
+                return True, scr
+            if any(k in scr for k in ("failed to connect", "FATAL",
+                                      "command not found", "No such file")):
+                return False, scr
+            time.sleep(0.2)
+        return False, scr
+
+    def wait_done(timeout=180, min_wait=0.6):
+        """等到最后一行重新出现提示符（shell 的 $/# 或 gsql 的 =#），才认为命令执行完。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            scr = screen()
+            lines = [x.rstrip() for x in scr.splitlines() if x.strip()]
+            if (time.time() - t0) >= min_wait and lines and _PROMPT_LINE_RE.match(lines[-1]):
+                return True
+            time.sleep(0.15)
+        return False
+
+    def send_wait(text, timeout=180, min_wait=0.6):
+        send(text)
+        if not wait_done(timeout=timeout, min_wait=min_wait):
+            raise RuntimeError("命令执行超时/未返回提示符（%s）。屏幕内容：\n%s"
+                               % (" ".join(text.split())[:80], screen()[-400:]))
+
+    def enter_gsql(timeout=45):
+        send("gsql -d postgres -p %d -r\r" % gsql_port)
+        ok, scr = wait_gsql_prompt(timeout)
+        tail = scr.rsplit("gsql -d postgres", 1)[-1] if "gsql -d postgres" in scr else scr
+        if not ok:
+            raise RuntimeError("打开数据库失败（请检查数据库是否启动/端口是否正确）。屏幕内容：\n"
+                               + tail[-400:])
+        send_wait("\\pset pager off\r", timeout=20)   # 关闭分页器，避免 --More-- 卡住
+
+    try:
+        ok, scr = wait_prompt(35)
+        if not ok:
+            raise RuntimeError("SSH 登录失败/超时（%s）。请先点「① 环境修复与初始化」。屏幕内容：\n%s"
+                               % (login_error(scr) or "未出现提示符", scr[-400:]))
+        send("sudo -u omm bash -l\r")
+        ok, scr = wait_omm_prompt(20)
+        if not ok:
+            raise RuntimeError("切换到 omm 用户失败（%s）。屏幕内容：\n%s"
+                               % (login_error(scr) or "未出现提示符", scr[-400:]))
+        # 优先 gs_om（gs_checkperf 依赖 Normal 集群状态），失败再回退 gs_ctl
+        send_wait("gs_om -t start || gs_ctl start -D %s -Z single_node -l %s/logfile\r"
+                  % (db_data_dir, db_data_dir), timeout=180, min_wait=1.0)
+        send_wait("clear\r", timeout=15, min_wait=0.4)   # 清掉启动输出
+        enter_gsql()
 
         for c in (setup or []):      # 连接后、截图前的清理/准备（不截图）
-            write_input(pid, c + "\r")
-            wait_settled(pid, settle=0.8, timeout=60, min_wait=1.0)
+            send_wait(c + "\r", timeout=120)
 
+        in_sql = True
         total = len(steps)
         for i, st in enumerate(steps):
-            write_input(pid, "\\! clear\r"); wait_settled(pid, settle=0.5, timeout=10, min_wait=0.5)
+            send_wait("\\! clear\r" if in_sql else "clear\r", timeout=15, min_wait=0.4)
             for c in st.get("commands", []):
-                write_input(pid, c + "\r")
-                wait_settled(pid, settle=0.7, timeout=45, min_wait=1.0)
+                if st.get("shell") or is_shell_command(c):
+                    if in_sql:                      # 退出 gsql，Shell 命令要在 omm shell 里跑
+                        send_wait("\\q\r", timeout=30)
+                        in_sql = False
+                    send_wait(c + "\r", timeout=180)   # gs_checkperf 等可能跑 15~30 秒
+                else:
+                    if not in_sql:                  # 重新连接 gsql 再执行 SQL
+                        enter_gsql()
+                        in_sql = True
+                    send_wait(c + "\r", timeout=90)
             p = shot(st.get("name", "step%02d" % (i + 1)))
             if p:
                 results.append((st.get("caption", ""), p))
@@ -426,10 +584,12 @@ def run_capture(ssh, gsql_port, steps, workdir, setup=None, log=print, progress=
             log("  [%d/%d] %s" % (i + 1, total, st.get("caption", "")))
 
         if stop_db:
-            write_input(pid, "\\! clear\r"); wait_settled(pid, settle=0.5, timeout=10, min_wait=0.5)
-            write_input(pid, "\\q\r"); wait_settled(pid, settle=0.6, timeout=20, min_wait=1.0)
-            write_input(pid, "gs_ctl stop -D %s\r" % db_data_dir)
-            wait_settled(pid, settle=1.0, timeout=90, min_wait=3)
+            send_wait("\\! clear\r" if in_sql else "clear\r", timeout=15, min_wait=0.4)
+            if in_sql:
+                send_wait("\\q\r", timeout=30)
+                in_sql = False
+            send_wait("gs_om -t stop || gs_ctl stop -D %s\r" % db_data_dir,
+                      timeout=180, min_wait=1.0)
             if capture_stop:
                 p = shot("99_quit_stop")
                 if p:
@@ -552,7 +712,8 @@ def build_docx(template, out_path, exp_name, purpose, device, result, problem, f
         p = content.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         p.paragraph_format.space_after = Pt(2); p.paragraph_format.space_before = Pt(2)
         set_font(p.add_run(cap), size=10.5, bold=True)
-        w, hh = Image.open(png).size
+        with Image.open(png) as im:
+            w, hh = im.size
         ip = content.add_paragraph(); ip.alignment = WD_ALIGN_PARAGRAPH.LEFT
         ip.paragraph_format.space_after = Pt(10)
         ip.add_run().add_picture(png, width=Cm(min(w / 96.0 * 2.54, 16.0)))
@@ -629,6 +790,11 @@ def detect_remote_env(ssh, password=None, log=print):
             elif line.startswith("GAUSSDATA="):
                 env["data_dir"] = line.split("=", 1)[1]
         env["installed"] = bool(env["gsql"])
+        if not env["data_dir"]:          # GAUSSDATA 未设置时，从进程参数里取 -D 数据目录
+            po, _ = remote_run(c, "ps -eo args 2>/dev/null | grep '[g]aussdb' | head -1")
+            m = re.search(r'-D\s+(\S+)', po)
+            if m:
+                env["data_dir"] = m.group(1)
         if env["data_dir"]:
             po, _ = remote_run(c, "sudo -u omm bash -lc 'grep -E \"^[[:space:]]*port[[:space:]]*=\" %s/postgresql.conf 2>/dev/null | head -1'"
                                % env["data_dir"])
@@ -649,25 +815,95 @@ def detect_remote_env(ssh, password=None, log=print):
     return env
 
 
-def ensure_remote_running(ssh, password=None, data_dir="", log=print):
-    """确保 openGauss 已启动，返回是否成功。"""
+def ensure_remote_running(ssh, password=None, data_dir="", log=print, port=5432):
+    """确保 openGauss 以 gs_om 正常集群状态运行（gs_checkperf 等工具依赖此状态）。"""
+    try:
+        port = int(port or 5432)
+    except Exception:
+        port = 5432
     c = _ssh(ssh["host"], ssh["port"], ssh["user"], password=password,
              key=ssh.get("key_path") if os.path.exists(ssh.get("key_path", "")) else None)
+
+    def run_omm(cmd, timeout=180):
+        return remote_run(c, "sudo -u omm bash -lc %s"
+                          % shlex.quote("source ~/.bashrc 2>/dev/null; " + cmd), timeout=timeout)
+
+    def listening():
+        out, _ = remote_run(c, "ss -tln 2>/dev/null | grep -E ':%d\\b' | head -1" % port)
+        return bool(out.strip())
+
+    def om_normal():
+        out, _ = run_omm("gs_om -t status --detail 2>&1")
+        return bool(re.search(r'cluster_state\s*:\s*Normal', out)), out
+
     try:
-        out, _ = remote_run(c, "ss -tln 2>/dev/null | grep -qE ':(5432|26000)' && echo up")
-        if "up" in out:
-            log("数据库已在运行")
+        normal, st = om_normal()
+        if listening() and normal:
+            log("数据库已在运行（端口 %d，集群状态 Normal）" % port)
             return True
-        log("数据库未运行，尝试启动…")
-        o2, e2 = remote_run(c, "sudo -u omm bash -lc 'source ~/.bashrc; gs_ctl start -D %s -Z single_node -l %s/logfile'"
-                            % (data_dir, data_dir), timeout=120)
+        log("数据库未处于正常集群状态，尝试用 gs_om 启动…")
+        o2, e2 = run_omm("gs_om -t start 2>&1")
         time.sleep(3)
-        o3, _ = remote_run(c, "ss -tln 2>/dev/null | grep -E ':(5432|26000)'")
-        ok = bool(o3.strip())
-        log("启动" + ("成功" if ok else "失败：" + (e2.strip() or o2.strip())))
+        normal, st = om_normal()
+        if listening() and normal:
+            log("启动成功（端口 %d，集群状态 Normal）" % port)
+            return True
+        if not data_dir:
+            log("gs_om 启动失败，且未配置数据目录，无法回退 gs_ctl：" + (e2.strip() or o2.strip())[:300])
+            return False
+        log("gs_om 启动未成功，回退 gs_ctl…")
+        o3, e3 = run_omm("gs_ctl start -D %s -Z single_node -l %s/logfile" % (data_dir, data_dir),
+                         timeout=120)
+        time.sleep(3)
+        ok = listening()
+        log("启动" + ("成功（端口 %d）" % port if ok else
+                      "失败：" + (e3.strip() or o3.strip() or e2.strip() or o2.strip())[:300]))
         return ok
     finally:
         c.close()
+
+
+def reset_databases(ssh, password=None, port=5432, statements=None, log=print):
+    """数据库初始化：在 postgres 库中逐条执行 setup（DROP 库/用户等）。
+
+    每条语句单独执行，避免多语句事务导致 DROP DATABASE 失败；
+    返回是否全部成功。
+    """
+    items, seen = [], set()
+    for raw in statements or []:
+        for part in str(raw).split(";"):        # setup 均为 DROP 语句，按分号拆开逐条执行
+            s = " ".join(part.split()).strip()
+            if not s:
+                continue
+            if not s.endswith(";"):
+                s += ";"
+            if s not in seen:
+                seen.add(s); items.append(s)
+    if not items:
+        log("数据库初始化：所选实验没有可执行的 setup 语句")
+        return True
+    try:
+        port = int(port or 5432)
+    except Exception:
+        port = 5432
+    c = _ssh(ssh["host"], ssh["port"], ssh["user"], password=password,
+             key=ssh.get("key_path") if os.path.exists(ssh.get("key_path", "")) else None)
+    ok = True
+    try:
+        for s in items:
+            inner = ("source ~/.bashrc 2>/dev/null; "
+                     "gsql -d postgres -p %d -r -c %s < /dev/null" % (port, shlex.quote(s)))
+            cmd = "sudo -u omm bash -lc %s" % shlex.quote(inner)
+            out, err = remote_run(c, cmd, timeout=120)
+            text = " ".join((out + "\n" + err).split())
+            if "ERROR" in text.upper():
+                ok = False
+                log("  [×] %s -> %s" % (s, text[:240]))
+            else:
+                log("  [√] %s" % s)
+    finally:
+        c.close()
+    return ok
 
 
 # ---------------------------------------------------------------- 本机 OpenSSH 修复（A）
